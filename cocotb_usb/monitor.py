@@ -1,7 +1,5 @@
-from cocotb.monitors import BusMonitor
-from cocotb.decorators import coroutine
+from cocotb_bus.monitors import BusMonitor
 from cocotb.triggers import RisingEdge, Timer
-from cocotb.result import TestFailure
 
 from cocotb_usb.usb.packet import sync, eop, nrzi
 
@@ -30,15 +28,14 @@ class UsbMonitor(BusMonitor):
         if self.state == self.IDLE:
             self.state = self.PRIMED
 
-    @coroutine
-    def _monitor_recv(self):
+    async def _monitor_recv(self):
         pkt = ""
         SYNC = nrzi(sync(), cycles=self.cycles)
         EOP = nrzi(eop(), cycles=self.cycles)
         bit_time = 0
 
         def current():
-            values = (self.dut.usb_d_p, self.dut.usb_d_n)
+            values = (self.dut.usb_d_p.value, self.dut.usb_d_n.value)
 
             if values == (0, 0):
                 return '_'
@@ -49,15 +46,15 @@ class UsbMonitor(BusMonitor):
             elif values == (0, 1):
                 return 'K'
             else:
-                raise TestFailure("Unrecognized dut values: {}".format(values))
+                raise AssertionError("Unrecognized dut values: {}".format(values))
 
         # We want to sample in the middle of a signal to allow for jitter
         t_middle = Timer(self.clock_period // 4, 'ps')
         bit_time_max = 12.5
         bit_time_acceptable = 7.5
         while True:
-            yield RisingEdge(self.clock)
-            yield t_middle
+            await RisingEdge(self.clock)
+            await t_middle
             if self.in_reset:
                 continue
 
@@ -69,7 +66,7 @@ class UsbMonitor(BusMonitor):
                     self.dut._log.error(
                         "No data after {} bit times, which is more than {}".
                         format(bit_time / 4.0 - 8, bit_time_max))
-                    raise TestFailure()
+                    raise AssertionError()
 
             pkt += current()
 
