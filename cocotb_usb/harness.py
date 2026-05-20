@@ -1,6 +1,7 @@
 from os import environ
 from cocotb_usb.host import UsbTest
 from cocotb_usb.host_valenty import UsbTestValenty
+from cocotb_usb.host_cdc import UsbTestCDC
 
 TARGET = environ.get('TARGET')
 
@@ -14,6 +15,8 @@ def get_harness(dut, **kwargs):
         dut_csrs = environ['DUT_CSRS']  # We want a KeyError if this is unset
         cdc = int(environ['TEST_CDC'])  # We want a KeyError if this is unset
         harness = UsbTestValenty(dut, dut_csrs, cdc, **kwargs)
+    elif TARGET == 'usb_cdc':
+        harness = UsbTestCDC(dut, **kwargs)
     else:  # No target matched
         harness = UsbTest(dut, **kwargs)  # base class
     return harness

@@ -1,5 +1,4 @@
 import csv
-from cocotb.result import TestFailure
 
 
 def grouper_tofit(n, iterable):
@@ -35,7 +34,7 @@ def parse_csr(csr_file="csr.csv"):
 
 def assertEqual(a, b, msg):
     if a != b:
-        raise TestFailure("{} vs {} - {}".format(a, b, msg))
+        raise AssertionError("{} vs {} - {}".format(a, b, msg))
 
 
 def getVal(val, minimum, maximum):

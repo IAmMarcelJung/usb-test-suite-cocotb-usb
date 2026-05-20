@@ -1,9 +1,6 @@
 import cocotb
-from cocotb.decorators import coroutine
+from cocotb_bus.drivers import BusDriver
 from cocotb.triggers import RisingEdge, Event
-from cocotb.drivers import BusDriver
-from cocotb.result import ReturnValue, TestFailure
-from cocotb.decorators import public
 
 
 def is_sequence(arg):
@@ -12,11 +9,7 @@ def is_sequence(arg):
 
 
 class WBAux():
-    """
-    Wishbone Auxiliary Wrapper Class
-
-    wrap meta informations on bus transaction (internal only)
-    """
+    """Wishbone Auxiliary Wrapper Class"""
     def __init__(self,
                  sel=0xf,
                  adr=0,
@@ -32,13 +25,8 @@ class WBAux():
         self.ts = tsStb
 
 
-@public
 class WBOp():
-    """
-    Wishbone Operations Wrapper Class
-
-    an attempt to wrap em tidy
-    """
+    """Wishbone Operations Wrapper Class"""
     def __init__(self, adr=0, dat=None, idle=0, sel=0xf):
         self.adr = adr
         self.dat = dat
@@ -46,13 +34,8 @@ class WBOp():
         self.idle = idle
 
 
-@public
 class WBRes():
-    """
-    Wishbone Result Wrapper Class.
-
-    What's happend on the bus plus meta information on timing
-    """
+    """Wishbone Result Wrapper Class"""
     def __init__(self,
                  ack=0,
                  sel=0xf,
@@ -73,31 +56,23 @@ class WBRes():
 
 
 class Wishbone(BusDriver):
-    """
-    Wishbone
-    """
+    """Wishbone"""
     _signals = ["cyc", "stb", "we", "sel", "adr", "datwr", "datrd", "ack"]
     _optional_signals = ["err", "stall", "rty"]
 
     def __init__(self, entity, name, clock, width=32):
         BusDriver.__init__(self, entity, name, clock)
-        # Drive some sensible defaults (setimmediatevalue to avoid x asserts)
         self._width = width
         self.bus.cyc.setimmediatevalue(0)
         self.bus.stb.setimmediatevalue(0)
         self.bus.we.setimmediatevalue(0)
         self.bus.adr.setimmediatevalue(0)
         self.bus.datwr.setimmediatevalue(0)
-
-        v = self.bus.sel.value
-        v.binstr = "1" * len(self.bus.sel)
-        self.bus.sel <= v
+        self.bus.sel.setimmediatevalue((1 << len(self.bus.sel)) - 1)
 
 
 class WishboneMaster(Wishbone):
-    """
-    Wishbone master
-    """
+    """Wishbone master"""
     def __init__(self, entity, name, clock, timeout=None, width=32):
         sTo = ", no cycle timeout"
         if timeout is not None:
@@ -113,132 +88,100 @@ class WishboneMaster(Wishbone):
         Wishbone.__init__(self, entity, name, clock, width)
         self.log.info("Wishbone Master created%s" % sTo)
 
-    @coroutine
-    def _clk_cycle_counter(self):
-        """
-        Cycle counter to time bus operations
-        """
+    async def _clk_cycle_counter(self):
         clkedge = RisingEdge(self.clock)
         self._clk_cycle_count = 0
         while self.busy:
-            yield clkedge
+            await clkedge
             self._clk_cycle_count += 1
 
-    @coroutine
-    def _open_cycle(self):
-        # Open new wishbone cycle
+    async def _open_cycle(self):
         if self.busy:
-            self.log.error(
-                "Opening Cycle, but WB Driver is already busy."
-            )
-            yield self.busy_event.wait()
+            self.log.error("Opening Cycle, but WB Driver is already busy.")
+            await self.busy_event.wait()
         self.busy_event.clear()
         self.busy = True
-        cocotb.fork(self._read())
-        cocotb.fork(self._clk_cycle_counter())
-        self.bus.cyc <= 1
+        cocotb.start_soon(self._read())
+        cocotb.start_soon(self._clk_cycle_counter())
+        self.bus.cyc.value = 1
         self._acked_ops = 0
         self._res_buf = []
         self._aux_buf = []
         self.log.debug("Opening cycle, %u Ops" % self._op_cnt)
 
-    @coroutine
-    def _close_cycle(self):
-        # Close current wishbone cycle
+    async def _close_cycle(self):
         clkedge = RisingEdge(self.clock)
         count = 0
         last_acked_ops = 0
-        # Wait for all Operations being acknowledged by the slave
-        # before lowering the cycle line. This is not mandatory by the bus
-        # standard, but a crossbar might send acks to the wrong master if we
-        # don't wait. We don't want to risk that, it could hang the bus
         while self._acked_ops < self._op_cnt:
             if last_acked_ops != self._acked_ops:
                 self.log.debug("Waiting for missing acks: %u/%u" %
                                (self._acked_ops, self._op_cnt))
             last_acked_ops = self._acked_ops
-            # check for timeout when finishing the cycle
             count += 1
             if (not (self._timeout is None)):
                 if (count > self._timeout):
-                    raise TestFailure(
+                    raise AssertionError(
                         "Timeout of %u clock cycles reached when waiting for"
                         "reply from slave"
                         % self._timeout)
-            yield clkedge
+            await clkedge
 
         self.busy = False
         self.busy_event.set()
-        self.bus.cyc <= 0
-        yield clkedge
+        self.bus.cyc.value = 0
+        await clkedge
 
-    @coroutine
-    def _wait_stall(self):
-        """Wait for stall to be low before continuing (Pipelined Wishbone)
-        """
+    async def _wait_stall(self):
+        """Wait for stall to be low before continuing (Pipelined Wishbone)"""
         clkedge = RisingEdge(self.clock)
         count = 0
         if hasattr(self.bus, "stall"):
-            count = 0
-            while self.bus.stall:
-                yield clkedge
+            while self.bus.stall.value:
+                await clkedge
                 count += 1
                 if (not (self._timeout is None)):
                     if (count > self._timeout):
-                        raise TestFailure(
+                        raise AssertionError(
                             "Timeout of %u clock cycles reached when on stall"
                             "from slave"
                             % self._timeout)
             self.log.debug("Stalled for %u cycles" % count)
-        raise ReturnValue(count)
+        return count
 
-    @coroutine
-    def _wait_ack(self):
-        """Wait for ACK on the bus before continuing (Non pipelined Wishbone)
-        """
-        # wait for acknownledgement before continuing
-        # Classic Wishbone without pipelining
+    async def _wait_ack(self):
+        """Wait for ACK on the bus before continuing (Non pipelined Wishbone)"""
         clkedge = RisingEdge(self.clock)
         count = 0
         if not hasattr(self.bus, "stall"):
             while not self._get_reply():
-                yield clkedge
+                await clkedge
                 count += 1
             self.log.debug("Waited %u cycles for acknowledge" % count)
-        raise ReturnValue(count)
+        return count
 
     def _get_reply(self):
-        # helper function for slave acks
-        tmpAck = int(self.bus.ack)
+        tmpAck = int(self.bus.ack.value)
         tmpErr = 0
         tmpRty = 0
         if hasattr(self.bus, "err"):
-            tmpErr = int(self.bus.err)
+            tmpErr = int(self.bus.err.value)
         if hasattr(self.bus, "rty"):
-            tmpRty = int(self.bus.rty)
-        # check if more than one line was raised
+            tmpRty = int(self.bus.rty.value)
         if ((tmpAck + tmpErr + tmpRty) > 1):
-            raise TestFailure(
+            raise AssertionError(
                 "Slave raised more than one reply line at once! ACK: %u ERR:"
                 "%u RTY: %u"
                 % (tmpAck, tmpErr, tmpRty))
-        # return 0 if no reply, 1 for ACK, 2 for ERR, 3 for RTY.
-        # use 'replyTypes' Dict for lookup
         return (tmpAck + 2 * tmpErr + 3 * tmpRty)
 
-    @coroutine
-    def _read(self):
-        """
-        Reader for slave replies
-        """
+    async def _read(self):
         count = 0
         clkedge = RisingEdge(self.clock)
         while self.busy:
             reply = self._get_reply()
-            # valid reply?
             if (bool(reply)):
-                datrd = int(self.bus.datrd)
-                # append reply and meta info to result buffer
+                datrd = int(self.bus.datrd.value)
                 tmpRes = WBRes(ack=reply,
                                sel=None,
                                adr=None,
@@ -249,75 +192,54 @@ class WishboneMaster(Wishbone):
                                waitAck=self._clk_cycle_count)
                 self._res_buf.append(tmpRes)
                 self._acked_ops += 1
-            yield clkedge
+            await clkedge
             count += 1
 
-    @coroutine
-    def _drive(self, we, adr, datwr, sel, idle):
-        """
-        Drive the Wishbone Master Out Lines
-        """
-
+    async def _drive(self, we, adr, datwr, sel, idle):
         clkedge = RisingEdge(self.clock)
         if self.busy:
-            # insert requested idle cycles
             if idle is not None:
                 idlecnt = idle
                 while idlecnt > 0:
                     idlecnt -= 1
-                    yield clkedge
-            # drive outputs
-            self.bus.stb <= 1
-            self.bus.adr <= adr
-            self.bus.sel <= sel
-            self.bus.datwr <= datwr
-            self.bus.we <= we
-            yield clkedge
-            # deal with flow control (pipelined wishbone)
-            stalled = yield self._wait_stall()
-            # append operation and meta info to auxiliary buffer
+                    await clkedge
+            self.bus.stb.value = 1
+            self.bus.adr.value = adr
+            self.bus.sel.value = sel
+            self.bus.datwr.value = datwr
+            self.bus.we.value = we
+            await clkedge
+            stalled = await self._wait_stall()
             self._aux_buf.append(
                 WBAux(sel, adr, datwr, stalled, idle, self._clk_cycle_count))
-            # non pipelined wishbone
-            yield self._wait_ack()
-            # reset strobe and write enable after the acknowledgement was
-            # received. Note that this was different from the original code,
-            # which cleared these values immediately.
-            # It is not clear from the spec whether these values must only be
-            # set on the first cycle, or they must be asserted until the other
-            # side acknowledges.
-            self.bus.stb <= 0
-            self.bus.we <= 0
+            await self._wait_ack()
+            self.bus.stb.value = 0
+            self.bus.we.value = 0
         else:
             self.log.error("Cannot drive the Wishbone bus outside a cycle!")
 
-    @coroutine
-    def send_cycle(self, arg):
-        """
-        The main sending routine
-
-        Args:
-            list(WishboneOperations)
-        """
+    async def send_cycle(self, arg):
+        """Send a list of WBOp operations in one Wishbone cycle."""
         cnt = 0
         clkedge = RisingEdge(self.clock)
-        yield clkedge
+        await clkedge
         if is_sequence(arg):
             if len(arg) < 1:
                 self.log.error("List contains no operations to carry out")
+                return None
             else:
                 self._op_cnt = len(arg)
                 firstword = True
+                result = []
                 for op in arg:
                     if not isinstance(op, WBOp):
-                        raise TestFailure(
+                        raise AssertionError(
                             "Sorry, argument must be a list of WBOp (Wishbone"
                             "Operation) objects!"
                         )
                     if firstword:
                         firstword = False
-                        result = []
-                        yield self._open_cycle()
+                        await self._open_cycle()
 
                     if op.dat is not None:
                         we = 1
@@ -325,16 +247,14 @@ class WishboneMaster(Wishbone):
                     else:
                         we = 0
                         dat = 0
-                    yield self._drive(we, op.adr, dat, op.sel, op.idle)
+                    await self._drive(we, op.adr, dat, op.sel, op.idle)
                     self.log.debug(
                         "#%3u WE: %s ADR: 0x%08x DAT: 0x%08x SEL: 0x%1x IDLE:"
                         "%3u"
                         % (cnt, we, op.adr << 2, dat, op.sel, op.idle))
                     cnt += 1
-                yield self._close_cycle()
+                await self._close_cycle()
 
-                # do pick and mix from result- and auxiliary buffer so we get
-                # all operation and meta info
                 for res, aux in zip(self._res_buf, self._aux_buf):
                     res.datwr = aux.datwr
                     res.sel = aux.sel
@@ -344,24 +264,21 @@ class WishboneMaster(Wishbone):
                     res.waitAck -= aux.ts
                     result.append(res)
 
-            raise ReturnValue(result)
+                return result
         else:
-            raise TestFailure(
+            raise AssertionError(
                 "Sorry, argument must be a list of WBOp (Wishbone Operation)"
                 " objects!"
             )
-            raise ReturnValue(None)
 
-    @coroutine
-    def read(self, adr):
-        result = yield self.send_cycle([WBOp(adr >> 2)])
+    async def read(self, adr):
+        result = await self.send_cycle([WBOp(adr >> 2)])
         for rec in result:
             self.log.debug("Result: {}".format(rec))
-        raise ReturnValue(result[-1].datrd)
+        return result[-1].datrd
 
-    @coroutine
-    def write(self, adr, data):
-        result = yield self.send_cycle([WBOp(adr >> 2, data)])
+    async def write(self, adr, data):
+        result = await self.send_cycle([WBOp(adr >> 2, data)])
         for rec in result:
             self.log.debug("Result: {}".format(rec))
-        raise ReturnValue(0)
+        return 0

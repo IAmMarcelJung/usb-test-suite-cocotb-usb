@@ -1,56 +1,18 @@
-import cocotb
-from cocotb.clock import Clock
-from cocotb.triggers import Timer, GPITrigger, TriggerException, _wait_callback
-from cocotb.utils import get_sim_steps, get_time_from_sim_steps
-
-import os
-from random import randint
 import itertools
+from random import randint
 
-if "COCOTB_SIM" in os.environ:
-    import simulator
-else:
-    simulator = None
+from cocotb.triggers import Timer
 
 
-class UnstableTrigger(GPITrigger):
-    """A trigger with uncertainty within defined range."""
-    def __init__(self, time_ps, delta_neg, delta_pos, units=None):
-        GPITrigger.__init__(self)
-        self.sim_steps = get_sim_steps(time_ps, units)
-        self.delta_neg = delta_neg
-        self.delta_pos = delta_pos
-
-    def prime(self, callback):
-        """Register for a timed callback."""
-        steps = self.sim_steps + randint(-self.delta_neg, self.delta_pos)
-        if self.cbhdl is None:
-            self.cbhdl = simulator.register_timed_callback(
-                steps, callback, self)
-            if self.cbhdl is None:
-                raise TriggerException("Unable set up %s Trigger" %
-                                       (str(self)))
-        GPITrigger.prime(self, callback)
-
-    def __str__(self):
-        """
-        >>> u = UnstableTrigger(100,5,3)
-        >>> print(u)
-        UnstableTrigger(0.10ps)
-        """
-        return self.__class__.__name__ + "(%1.2fps)" % get_time_from_sim_steps(
-            self.sim_steps, units='ps')
-
-
-class UnstableClock(Clock):
+class UnstableClock:
     """A 50:50 duty cycle clock driver with added jitter.
 
     Args:
         signal: The clock pin/signal to be driven.
         period (int): The clock period. Must convert to an even number of
             timesteps.
-        jitter_neg (int): Maximum negative jitter.
-        jitter_pos (int): Maximum positive jitter.
+        jitter_neg (int): Maximum negative jitter applied to each half period.
+        jitter_pos (int): Maximum positive jitter applied to each half period.
         units (str, optional): One of
             ``None``, ``'fs'``, ``'ps'``, ``'ns'``, ``'us'``, ``'ms'``,
             ``'sec'``.
@@ -58,69 +20,43 @@ class UnstableClock(Clock):
             the simulator.
     """
     def __init__(self, signal, period, jitter_neg, jitter_pos, units=None):
-        super().__init__(signal, period, units)
+        self.signal = signal
+        self.period = period
+        self.half_period = period / 2
         self.jitter_neg = jitter_neg
         self.jitter_pos = jitter_pos
         self.units = units
 
-    @cocotb.coroutine
-    def start(self, cycles=None, start_high=True):
-        """Clocking coroutine. Start driving your clock by forking a
-        call to this.
+    @property
+    def frequency(self):
+        scale = {'fs': 1e15, 'ps': 1e12, 'ns': 1e9, 'us': 1e6,
+                 'ms': 1e3, 'sec': 1}
+        s = scale.get(self.units, 1) if self.units else 1
+        return s / self.period / 1e6  # MHz
+
+    async def start(self, cycles=None, start_high=True):
+        """Drive the clock with per-half-period jitter.
 
         Args:
-            cycles (int, optional): Cycle the clock *cycles* number of times,
-                or if ``None`` then cycle the clock forever.
-                Note: ``0`` is not the same as ``None``, as ``0`` will cycle
-                no times.
-            start_high (bool, optional): Whether to start the clock with
-                a ``1`` for the first half of the period.
-                Default is ``True``.
+            cycles (int, optional): Number of full cycles, or ``None`` forever.
+            start_high (bool, optional): Start high. Default True.
         """
-        # We need two objects to allow their periods to overlap
-        u1 = UnstableTrigger(self.half_period, self.jitter_neg,
-                             self.jitter_pos, self.units)
-        u2 = UnstableTrigger(self.half_period, self.jitter_neg,
-                             self.jitter_pos, self.units)
+        it = itertools.count() if cycles is None else range(cycles)
 
-        t = Timer(self.half_period)
-
-        if cycles is None:
-            it = itertools.count()
-        else:
-            it = range(cycles)
-
-        def strobeH(ret):
-            self.signal <= 1
-
-        def strobeL(ret):
-            self.signal <= 0
-
-        # branch outside for loop for performance
         if start_high:
-            self.signal <= 1
+            self.signal.value = 1
             for _ in it:
-                cocotb.fork(_wait_callback(u1, strobeL))
-                yield t
-                cocotb.fork(_wait_callback(u2, strobeH))
-                yield t
+                await Timer(self.half_period + randint(-self.jitter_neg, self.jitter_pos), self.units)
+                self.signal.value = 0
+                await Timer(self.half_period + randint(-self.jitter_neg, self.jitter_pos), self.units)
+                self.signal.value = 1
         else:
-            self.signal <= 0
+            self.signal.value = 0
             for _ in it:
-                cocotb.fork(_wait_callback(u1, strobeH))
-                yield t
-                cocotb.fork(_wait_callback(u2, strobeL))
-                yield t
+                await Timer(self.half_period + randint(-self.jitter_neg, self.jitter_pos), self.units)
+                self.signal.value = 1
+                await Timer(self.half_period + randint(-self.jitter_neg, self.jitter_pos), self.units)
+                self.signal.value = 0
 
     def __str__(self):
-        """
-        >>> c = UnstableClock(None,100,5,3)
-        >>> print(c)
-        UnstableClock(10000000.0 MHz)
-        """
         return self.__class__.__name__ + "(%3.1f MHz)" % self.frequency
-
-
-if __name__ == "__main__":
-    import doctest
-    doctest.testmod()
